@@ -35,6 +35,7 @@ func TestCompile(t *testing.T) {
 		"noop split with resolver":                         testcase_NoopSplit_WithResolver(),
 		"subset split":                                     testcase_SubsetSplit(),
 		"service split":                                    testcase_ServiceSplit(),
+		"service split with weight ratio":                  testcase_ServiceSplitWeightRatio(),
 		"split bypasses next splitter":                     testcase_SplitBypassesSplit(),
 		"service redirect":                                 testcase_ServiceRedirect(),
 		"service and subset redirect":                      testcase_ServiceAndSubsetRedirect(),
@@ -789,6 +790,69 @@ func testcase_ServiceSplit() compileTestCase {
 					},
 					{
 						Weight:   40,
+						NextNode: "resolver:bar.default.dc1",
+					},
+				},
+			},
+			"resolver:foo.default.dc1": {
+				Type: structs.DiscoveryGraphNodeTypeResolver,
+				Name: "foo.default.dc1",
+				Resolver: &structs.DiscoveryResolver{
+					Default:        true,
+					ConnectTimeout: 5 * time.Second,
+					Target:         "foo.default.dc1",
+				},
+			},
+			"resolver:bar.default.dc1": {
+				Type: structs.DiscoveryGraphNodeTypeResolver,
+				Name: "bar.default.dc1",
+				Resolver: &structs.DiscoveryResolver{
+					Default:        true,
+					ConnectTimeout: 5 * time.Second,
+					Target:         "bar.default.dc1",
+				},
+			},
+		},
+		Targets: map[string]*structs.DiscoveryTarget{
+			"foo.default.dc1": newTarget("foo", "", "default", "dc1", nil),
+			"bar.default.dc1": newTarget("bar", "", "default", "dc1", nil),
+		},
+	}
+
+	return compileTestCase{entries: entries, expect: expect}
+}
+
+func testcase_ServiceSplitWeightRatio() compileTestCase {
+	entries := newEntries()
+	setServiceProtocol(entries, "main", "http")
+	setServiceProtocol(entries, "foo", "http")
+	setServiceProtocol(entries, "bar", "http")
+
+	entries.AddSplitters(
+		&structs.ServiceSplitterConfigEntry{
+			Kind: "service-splitter",
+			Name: "main",
+			Splits: []structs.ServiceSplit{
+				{Weight: 1, Service: "foo"},
+				{Weight: 2, Service: "bar"},
+			},
+		},
+	)
+
+	expect := &structs.CompiledDiscoveryChain{
+		Protocol:  "http",
+		StartNode: "splitter:main.default",
+		Nodes: map[string]*structs.DiscoveryGraphNode{
+			"splitter:main.default": {
+				Type: structs.DiscoveryGraphNodeTypeSplitter,
+				Name: "main.default",
+				Splits: []*structs.DiscoverySplit{
+					{
+						Weight:   33.33,
+						NextNode: "resolver:foo.default.dc1",
+					},
+					{
+						Weight:   66.67,
 						NextNode: "resolver:bar.default.dc1",
 					},
 				},

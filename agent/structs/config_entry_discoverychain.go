@@ -463,7 +463,7 @@ type ServiceSplitterConfigEntry struct {
 
 	// Splits is the configurations for the details of the traffic splitting.
 	//
-	// The sum of weights across all splits must add up to 100.
+	// The sum of weights across all splits will be normalized to 100.
 	//
 	// If the split is within epsilon of 100 then the remainder is attributed
 	// to the FIRST split.
@@ -500,17 +500,56 @@ func (e *ServiceSplitterConfigEntry) Normalize() error {
 
 	e.Kind = ServiceSplitter
 
-	// This slightly massages inputs to enforce that the smallest representable
-	// weight is 1/10000 or .01%
+	// The normalization method does the following:
+	// - normalizes weights such that their sum is 100
+	// - slightly massages weights to enforce that normalized weights are
+	//   quantized in increments of 0.01
 
 	e.EnterpriseMeta.Normalize()
 
 	if len(e.Splits) > 0 {
+		// Compute normalization scalar that can be applied to weights to force
+		// their sum to be ~100, allowing for definition of relative weights.
+		// For example, weights of {1, 1} would convert into {50, 50}.
+		sumWeights := float32(0.0)
+		for _, split := range e.Splits {
+			sumWeights += split.Weight;
+
+			// Negative weights are invalid
+			if (split.Weight < float32(0.0)) {
+				return fmt.Errorf("all weights must be positive, weight %f encountered", split.Weight)
+			}
+		}
+
+		// Even if all weights are non-negative, they can still all be 0.0.
+		// This check protects against weights of all 0.0, which cannot be
+		// normalized.
+		if (sumWeights <= float32(0.0)) {
+			return fmt.Errorf("sum of input weights must be positive to be normalized, is instead %f", sumWeights)
+		}
+
+		normalizationScalar := 100.0 / sumWeights;
+
+		// Normalize + quantize weights.
+		// Recompute sum of weights to check deviation from target sum of
+		// 100.0.
+		sumWeights = float32(0.0)
 		for i, split := range e.Splits {
 			if split.Namespace == "" {
 				split.Namespace = e.EnterpriseMeta.NamespaceOrDefault()
 			}
-			e.Splits[i].Weight = NormalizeServiceSplitWeight(split.Weight)
+			e.Splits[i].Weight = NormalizeServiceSplitWeight(split.Weight * normalizationScalar)
+
+			sumWeights += e.Splits[i].Weight
+		}
+
+		// Add any deviation from target sum of 100.0 to 0th weight, forcing
+		// final sum to 100.0.
+		targetSumDeviation := float32(100.0) - sumWeights
+		if (targetSumDeviation != float32(0.0)) {
+			// Reapply NormalizeServiceSplitWeight to retain quantization by
+			// 0.01.
+			e.Splits[0].Weight = NormalizeServiceSplitWeight(e.Splits[0].Weight + targetSumDeviation)
 		}
 	}
 
@@ -560,6 +599,9 @@ func (e *ServiceSplitterConfigEntry) Validate() error {
 
 	sumScaled := 0
 	for _, split := range e.Splits {
+		if (split.Weight < float32(0.0)) {
+			return fmt.Errorf("all weights must be positive, weight %f encountered", split.Weight)
+		}
 		sumScaled += scaleWeight(split.Weight)
 	}
 

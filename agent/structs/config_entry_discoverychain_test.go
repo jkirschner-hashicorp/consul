@@ -919,7 +919,7 @@ func TestServiceSplitterConfigEntry(t *testing.T) {
 			validateErr: "no splits configured",
 		},
 		{
-			name: "1 split",
+			name: "1 split at 100 weight",
 			entry: makesplitter(
 				makesplit(100, "test", "", ""),
 			),
@@ -928,24 +928,22 @@ func TestServiceSplitterConfigEntry(t *testing.T) {
 			},
 		},
 		{
-			name: "1 split not enough weight",
+			name: "1 split below 100 weight",
 			entry: makesplitter(
 				makesplit(99.99, "test", "", ""),
 			),
 			check: func(t *testing.T, entry *ServiceSplitterConfigEntry) {
-				require.Equal(t, float32(99.99), entry.Splits[0].Weight)
+				require.Equal(t, float32(100.0), entry.Splits[0].Weight)
 			},
-			validateErr: "the sum of all split weights must be 100",
 		},
 		{
-			name: "1 split too much weight",
+			name: "1 split above 100 weight",
 			entry: makesplitter(
 				makesplit(100.01, "test", "", ""),
 			),
 			check: func(t *testing.T, entry *ServiceSplitterConfigEntry) {
-				require.Equal(t, float32(100.01), entry.Splits[0].Weight)
+				require.Equal(t, float32(100.0), entry.Splits[0].Weight)
 			},
-			validateErr: "the sum of all split weights must be 100",
 		},
 		{
 			name: "2 splits",
@@ -970,28 +968,42 @@ func TestServiceSplitterConfigEntry(t *testing.T) {
 			},
 		},
 		{
-			name: "2 splits not enough weight",
+			name: "2 splits weight sum just below 100",
 			entry: makesplitter(
 				makesplit(99.98, "test", "v1", ""),
 				makesplit(0.01, "test", "v2", ""),
 			),
 			check: func(t *testing.T, entry *ServiceSplitterConfigEntry) {
-				require.Equal(t, float32(99.98), entry.Splits[0].Weight)
+				require.Equal(t, float32(99.99), entry.Splits[0].Weight)
 				require.Equal(t, float32(0.01), entry.Splits[1].Weight)
 			},
-			validateErr: "the sum of all split weights must be 100",
 		},
 		{
-			name: "2 splits too much weight",
+			name: "2 splits weight sum just above 100",
 			entry: makesplitter(
 				makesplit(100, "test", "v1", ""),
 				makesplit(0.01, "test", "v2", ""),
 			),
 			check: func(t *testing.T, entry *ServiceSplitterConfigEntry) {
-				require.Equal(t, float32(100), entry.Splits[0].Weight)
+				require.Equal(t, float32(99.99), entry.Splits[0].Weight)
 				require.Equal(t, float32(0.01), entry.Splits[1].Weight)
 			},
-			validateErr: "the sum of all split weights must be 100",
+		},
+		{
+			name: "2 splits zero weight",
+			entry: makesplitter(
+				makesplit(0.0, "test", "v1", ""),
+				makesplit(0.0, "test", "v2", ""),
+			),
+			normalizeErr: "sum of input weights must be positive to be normalized",
+		},
+		{
+			name: "2 splits with a negative weight",
+			entry: makesplitter(
+				makesplit(101.0, "test", "v1", ""),
+				makesplit(-1.0, "test", "v2", ""),
+			),
+			normalizeErr: "all weights must be positive",
 		},
 		{
 			name: "3 splits",
@@ -1004,6 +1016,19 @@ func TestServiceSplitterConfigEntry(t *testing.T) {
 				require.Equal(t, float32(34), entry.Splits[0].Weight)
 				require.Equal(t, float32(33), entry.Splits[1].Weight)
 				require.Equal(t, float32(33), entry.Splits[2].Weight)
+			},
+		},
+		{
+			name: "3 splits ratio",
+			entry: makesplitter(
+				makesplit(1, "test", "v1", ""),
+				makesplit(1, "test", "v2", ""),
+				makesplit(1, "test", "v3", ""),
+			),
+			check: func(t *testing.T, entry *ServiceSplitterConfigEntry) {
+				require.Equal(t, float32(33.34), entry.Splits[0].Weight)
+				require.Equal(t, float32(33.33), entry.Splits[1].Weight)
+				require.Equal(t, float32(33.33), entry.Splits[2].Weight)
 			},
 		},
 		{
