@@ -342,18 +342,6 @@ func (s *Store) PreparedQueryGet(ws memdb.WatchSet, queryIDOrName string) (uint6
 		}
 	}
 
-	// Next, look for the longest prefix match among the prepared query
-	// templates.
-	{
-		wrapped, err := tx.LongestPrefix("prepared-queries", "template_prefix", queryIDOrName)
-		if err != nil {
-			return 0, nil, fmt.Errorf("failed prepared query lookup: %s", err)
-		}
-		if wrapped != nil {
-			return idx, toPreparedQuery(wrapped), nil
-		}
-	}
-
 	return idx, nil, nil
 }
 
