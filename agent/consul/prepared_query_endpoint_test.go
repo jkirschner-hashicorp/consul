@@ -917,10 +917,11 @@ func TestPreparedQuery_Get(t *testing.T) {
 
 	// Capture the ID, then read back the query to verify.
 	query.Query.ID = reply
+	fmt.Printf("QUERY ID: %#v\n", reply)
 	{
 		req := &structs.PreparedQuerySpecificRequest{
 			Datacenter:   "dc1",
-			QueryID:      query.Query.ID,
+			QueryID:      "redis-master",//query.Query.ID,
 			QueryOptions: structs.QueryOptions{Token: token},
 		}
 		var resp structs.IndexedPreparedQueries
@@ -1378,6 +1379,7 @@ func TestPreparedQuery_Explain(t *testing.T) {
 			Token: "5e1e24e5-1329-f86f-18c6-3d3734edb2cd",
 			Template: structs.QueryTemplateOptions{
 				Type: structs.QueryTemplateTypeNamePrefixMatch,
+				Regexp: "hi blake",
 			},
 			Service: structs.ServiceQuery{
 				Service: "${name.full}",
@@ -1406,6 +1408,7 @@ func TestPreparedQuery_Explain(t *testing.T) {
 		}
 
 		actual := &resp.Query
+		fmt.Printf("PREP QUERY, %#v\n", actual)
 		actual.CreateIndex, actual.ModifyIndex = 0, 0
 		if !reflect.DeepEqual(actual, query.Query) {
 			t.Fatalf("bad: %v", actual)

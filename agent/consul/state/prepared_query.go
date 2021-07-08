@@ -276,21 +276,85 @@ func preparedQueryDeleteTxn(tx WriteTxn, idx uint64, queryID string) error {
 	return nil
 }
 
+// // PreparedQueryGet returns the given prepared query by ID.
+// func (s *Store) PreparedQueryGet(ws memdb.WatchSet, queryID string) (uint64, *structs.PreparedQuery, error) {
+// 	fmt.Printf("In PreparedQueryGet: %#v\n", queryID)
+// 	tx := s.db.Txn(false)
+// 	defer tx.Abort()
+
+// 	// Get the table index.
+// 	idx := maxIndexTxn(tx, "prepared-queries")
+
+// 	// Look up the query by its ID.
+// 	watchCh, wrapped, err := tx.FirstWatch("prepared-queries", "id", queryID)
+// 	if err != nil {
+// 		return 0, nil, fmt.Errorf("failed prepared query lookup: %s", err)
+// 	}
+// 	ws.Add(watchCh)
+// 	return idx, toPreparedQuery(wrapped), nil
+// }
+
 // PreparedQueryGet returns the given prepared query by ID.
-func (s *Store) PreparedQueryGet(ws memdb.WatchSet, queryID string) (uint64, *structs.PreparedQuery, error) {
+func (s *Store) PreparedQueryGet(ws memdb.WatchSet, queryIDOrName string) (uint64, *structs.PreparedQuery, error) {
+	fmt.Printf("In PreparedQueryGet: %#v\n", queryIDOrName)
 	tx := s.db.Txn(false)
 	defer tx.Abort()
 
 	// Get the table index.
 	idx := maxIndexTxn(tx, "prepared-queries")
 
-	// Look up the query by its ID.
-	watchCh, wrapped, err := tx.FirstWatch("prepared-queries", "id", queryID)
-	if err != nil {
-		return 0, nil, fmt.Errorf("failed prepared query lookup: %s", err)
+	// Explicitly ban an empty query. This will never match an ID and the
+	// schema is set up so it will never match a query with an empty name,
+	// but we check it here to be explicit about it (we'd never want to
+	// return the results from the first query w/o a name).
+	if queryIDOrName == "" {
+		return 0, nil, ErrMissingQueryID
 	}
-	ws.Add(watchCh)
-	return idx, toPreparedQuery(wrapped), nil
+
+	// Try first by ID if it looks like they gave us an ID. We check the
+	// format before trying this because the UUID index will complain if
+	// we look up something that's not formatted like one.
+	if isUUID(queryIDOrName) {
+		watchCh, wrapped, err := tx.FirstWatch("prepared-queries", "id", queryIDOrName)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed prepared query lookup: %s", err)
+		}
+		if wrapped != nil {
+			query := toPreparedQuery(wrapped)
+			if prepared_query.IsTemplate(query) {
+				return idx, nil, fmt.Errorf("prepared query templates can only be resolved up by name, not by ID")
+			}
+			ws.Add(watchCh)
+			return idx, query, nil
+		}
+	}
+
+	// Next, look for an exact name match. This is the common case for static
+	// prepared queries, and could also apply to templates.
+	{
+		watchCh, wrapped, err := tx.FirstWatch("prepared-queries", "name", queryIDOrName)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed prepared query lookup: %s", err)
+		}
+		if wrapped != nil {
+			ws.Add(watchCh)
+			return idx, toPreparedQuery(wrapped), nil
+		}
+	}
+
+	// Next, look for the longest prefix match among the prepared query
+	// templates.
+	{
+		wrapped, err := tx.LongestPrefix("prepared-queries", "template_prefix", queryIDOrName)
+		if err != nil {
+			return 0, nil, fmt.Errorf("failed prepared query lookup: %s", err)
+		}
+		if wrapped != nil {
+			return idx, toPreparedQuery(wrapped), nil
+		}
+	}
+
+	return idx, nil, nil
 }
 
 // PreparedQueryResolve returns the given prepared query by looking up an ID or
