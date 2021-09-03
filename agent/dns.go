@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"regexp"
@@ -129,9 +130,8 @@ type DNSServer struct {
 type dnsNodeRecordSet struct {
 	Answers           []dns.RR
 	Extra             []dns.RR
-	// Weight * random number [0,1).
 	// Used for an efficient weighted sorting algorithm
-	WeightRandomized  float32
+	WeightRandomized  float64
 }
 
 func NewDNSServer(a *Agent) (*DNSServer, error) {
@@ -1391,7 +1391,7 @@ func (d *DNSServer) preparedQueryLookup(cfg *dnsConfig, datacenter, query string
 		d.serviceNodeRecords(cfg, out.Datacenter, out.Nodes, req, resp, ttl, maxRecursionLevel)
 	}
 
-	fmt.Printf("ANSWER: %+v\n", resp.Answer)
+	// fmt.Printf("ANSWER: %+v\n", resp.Answer)
 
 	// for _, ansRR := range resp.Answer {
 	// 	srv, ok := ansRR.(*dns.SRV)
@@ -1490,9 +1490,12 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 				answerCNAME = records
 			}
 		default:
+			// Algorithm from:
+			// https://softwareengineering.stackexchange.com/a/344274 ->
+			// http://utopia.duth.gr/~pefraimi/research/data/2007EncOfAlg.pdf
 			recordSets = append(recordSets, dnsNodeRecordSet{
 				Answers: records,
-				WeightRandomized: float32(weight) * rand.Float32(),
+				WeightRandomized: math.Pow(rand.Float64(), 1.0 / float64(weight)),
 			})
 			had_answer = true
 		}
@@ -1894,7 +1897,7 @@ func (d *DNSServer) serviceSRVRecords(cfg *dnsConfig, dc string, nodes structs.C
 		recordSets = append(recordSets, dnsNodeRecordSet{
 			Answers: answers,
 			Extra: extra,
-			WeightRandomized: float32(weight) * rand.Float32(),
+			WeightRandomized: math.Pow(rand.Float64(), 1.0 / float64(weight)),
 		})
 	}
 
@@ -1904,7 +1907,7 @@ func (d *DNSServer) serviceSRVRecords(cfg *dnsConfig, dc string, nodes structs.C
 		// "lesser" value for sorting purposes)
 		return recordSets[i].WeightRandomized > recordSets[j].WeightRandomized
 	})
-	fmt.Printf("Record SRV %v\n", recordSets)
+	// fmt.Printf("Record SRV %v\n", recordSets)
 
 	for _, recordSet := range recordSets {
 		resp.Answer = append(resp.Answer, recordSet.Answers...)
