@@ -1393,13 +1393,13 @@ func (d *DNSServer) preparedQueryLookup(cfg *dnsConfig, datacenter, query string
 
 	fmt.Printf("ANSWER: %+v\n", resp.Answer)
 
-	for _, ansRR := range resp.Answer {
-		srv, ok := ansRR.(*dns.SRV)
-		if !ok {
-			continue
-		}
-		fmt.Printf("SRV WEIGHT: %d\n", srv.Weight)
-	}
+	// for _, ansRR := range resp.Answer {
+	// 	srv, ok := ansRR.(*dns.SRV)
+	// 	if !ok {
+	// 		continue
+	// 	}
+	// 	// fmt.Printf("SRV WEIGHT: %d\n", srv.Weight)
+	// }
 
 	if len(resp.Answer) == 0 {
 		return errNoData
@@ -1467,11 +1467,6 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 		
 		records, _, weight := d.nodeServiceRecords(dc, node, req, ttl, cfg, maxRecursionLevel)
 
-		recordSets = append(recordSets, dnsNodeRecordSet{
-			Answers: records,
-			WeightRandomized: float32(weight) * rand.Float32(),
-		})
-		fmt.Printf("Weight: %+v\n", recordSets)
 		if len(records) == 0 {
 			continue
 		}
@@ -1495,8 +1490,14 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 				answerCNAME = records
 			}
 		default:
+			recordSets = append(recordSets, dnsNodeRecordSet{
+				Answers: records,
+				WeightRandomized: float32(weight) * rand.Float32(),
+			})
 			had_answer = true
 		}
+
+		// fmt.Printf("Weight: %+v\n", recordSets)
 
 		// This block must exist outside of the default case of the switch
 		// statement above so that we can break out of the for loop if needed
@@ -1512,7 +1513,7 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 
 	// If the only answer is a CNAME RR, return that CNAME RR + its associated
 	// RRs, but no other RRs.
-	if len(resp.Answer) == 0 && len(answerCNAME) > 0 {
+	if len(recordSets) == 0 && len(answerCNAME) > 0 {
 		resp.Answer = answerCNAME
 		return
 	}
@@ -1527,7 +1528,7 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 		// "lesser" value for sorting purposes)
 		return recordSets[i].WeightRandomized > recordSets[j].WeightRandomized
 	})
-	fmt.Printf("Record %v", recordSets)
+	// fmt.Printf("Record Node %v\n", recordSets)
 
 	// Append from recordSets to resp.Answer
 	for _, recordSet := range recordSets {
@@ -1871,9 +1872,8 @@ func (d *DNSServer) generateMeta(qName string, node *structs.Node, ttl time.Dura
 func (d *DNSServer) serviceSRVRecords(cfg *dnsConfig, dc string, nodes structs.CheckServiceNodes, req, resp *dns.Msg, ttl time.Duration, maxRecursionLevel int) {
 	handled := make(map[string]struct{})
 
-	// What want to do:
-	// Get answers. Sort by SRV record by weight. Problem: this won't sort A records, only SRV.
-	// A records don't have weight. They'd have to be sorted beforehand.
+	recordSets := make([]dnsNodeRecordSet, 0, len(nodes))
+
 	for _, node := range nodes {
 		// Avoid duplicate entries, possible if a node has
 		// the same service the same port, etc.
@@ -1886,14 +1886,29 @@ func (d *DNSServer) serviceSRVRecords(cfg *dnsConfig, dc string, nodes structs.C
 		handled[tuple] = struct{}{}
 
 		answers, extra, weight := d.nodeServiceRecords(dc, node, req, ttl, cfg, maxRecursionLevel)
-		fmt.Printf("Weight: %d\n", weight)
-
-		resp.Answer = append(resp.Answer, answers...)
-		resp.Extra = append(resp.Extra, extra...)
 
 		if cfg.NodeMetaTXT {
-			resp.Extra = append(resp.Extra, d.generateMeta(fmt.Sprintf("%s.node.%s.%s", node.Node.Node, dc, d.domain), node.Node, ttl)...)
+			extra = append(extra, d.generateMeta(fmt.Sprintf("%s.node.%s.%s", node.Node.Node, dc, d.domain), node.Node, ttl)...)
 		}
+
+		recordSets = append(recordSets, dnsNodeRecordSet{
+			Answers: answers,
+			Extra: extra,
+			WeightRandomized: float32(weight) * rand.Float32(),
+		})
+	}
+
+	sort.Slice(recordSets, func(i, j int) bool {
+		// Because higher weights should be more likely to come first,
+		// we need to sort in reverse order (higher weight is treated as a
+		// "lesser" value for sorting purposes)
+		return recordSets[i].WeightRandomized > recordSets[j].WeightRandomized
+	})
+	fmt.Printf("Record SRV %v\n", recordSets)
+
+	for _, recordSet := range recordSets {
+		resp.Answer = append(resp.Answer, recordSet.Answers...)
+		resp.Extra = append(resp.Extra, recordSet.Extra...)
 	}
 }
 
