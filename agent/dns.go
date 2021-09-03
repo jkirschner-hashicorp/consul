@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -122,6 +124,14 @@ type DNSServer struct {
 	// recursorEnabled stores whever the recursor handler is enabled as an atomic flag.
 	// the recursor handler is only enabled if recursors are configured. This flag is used during config hot-reloading
 	recursorEnabled uint32
+}
+
+type dnsNodeRecordSet struct {
+	Answers           []dns.RR
+	Extra             []dns.RR
+	// Weight * random number [0,1).
+	// Used for an efficient weighted sorting algorithm
+	WeightRandomized  float32
 }
 
 func NewDNSServer(a *Agent) (*DNSServer, error) {
@@ -1381,6 +1391,16 @@ func (d *DNSServer) preparedQueryLookup(cfg *dnsConfig, datacenter, query string
 		d.serviceNodeRecords(cfg, out.Datacenter, out.Nodes, req, resp, ttl, maxRecursionLevel)
 	}
 
+	fmt.Printf("ANSWER: %+v\n", resp.Answer)
+
+	for _, ansRR := range resp.Answer {
+		srv, ok := ansRR.(*dns.SRV)
+		if !ok {
+			continue
+		}
+		fmt.Printf("SRV WEIGHT: %d\n", srv.Weight)
+	}
+
 	if len(resp.Answer) == 0 {
 		return errNoData
 	}
@@ -1433,11 +1453,25 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 	handled := make(map[string]struct{})
 	var answerCNAME []dns.RR = nil
 
+	recordSets := make([]dnsNodeRecordSet, 0, len(nodes))
+
+	// Sequence
+	// - Need to build a slice of weights, answers, + extra
+	// - At end, sort the slice in a weighted manner by applying
+	//   random number to weights, then sorting
+	// - Copy sorted version into resp.Answer.
+
 	count := 0
 	for _, node := range nodes {
 		// Add the node record
-		had_answer := false
-		records, _ := d.nodeServiceRecords(dc, node, req, ttl, cfg, maxRecursionLevel)
+		
+		records, _, weight := d.nodeServiceRecords(dc, node, req, ttl, cfg, maxRecursionLevel)
+
+		recordSets = append(recordSets, dnsNodeRecordSet{
+			Answers: records,
+			WeightRandomized: float32(weight) * rand.Float32(),
+		})
+		fmt.Printf("Weight: %+v\n", recordSets)
 		if len(records) == 0 {
 			continue
 		}
@@ -1449,29 +1483,55 @@ func (d *DNSServer) serviceNodeRecords(cfg *dnsConfig, dc string, nodes structs.
 		}
 		handled[records[0].String()] = struct{}{}
 
+		had_answer := false
+
 		switch records[0].(type) {
 		case *dns.CNAME:
 			// keep track of the first CNAME + associated RRs but don't add to the resp.Answer yet
-			// this will only be added if no non-CNAME RRs are found
+			// this will only be added if no non-CNAME RRs are found.
+			// TODO(jkirschner): ask reviewer about this old code. Comment is inaccurate, this
+			// tracks the *last* CNAME + associated RRs, not the *first*.
 			if len(answerCNAME) == 0 {
 				answerCNAME = records
 			}
 		default:
-			resp.Answer = append(resp.Answer, records...)
 			had_answer = true
 		}
 
+		// This block must exist outside of the default case of the switch
+		// statement above so that we can break out of the for loop if needed
+		// (rather than out of the switch statement)
 		if had_answer {
 			count++
 			if count == cfg.ARecordLimit {
-				// We stop only if greater than 0 or we reached the limit
-				return
+				// Exit for loop early if we reach the limit
+				break
 			}
 		}
 	}
 
+	// If the only answer is a CNAME RR, return that CNAME RR + its associated
+	// RRs, but no other RRs.
 	if len(resp.Answer) == 0 && len(answerCNAME) > 0 {
 		resp.Answer = answerCNAME
+		return
+	}
+
+	// Otherwise, return all RRs not associated with 
+
+	// Perform a random sort of the output records
+
+	sort.Slice(recordSets, func(i, j int) bool {
+		// Because higher weights should be more likely to come first,
+		// we need to sort in reverse order (higher weight is treated as a
+		// "lesser" value for sorting purposes)
+		return recordSets[i].WeightRandomized > recordSets[j].WeightRandomized
+	})
+	fmt.Printf("Record %v", recordSets)
+
+	// Append from recordSets to resp.Answer
+	for _, recordSet := range recordSets {
+		resp.Answer = append(resp.Answer, recordSet.Answers...)
 	}
 }
 
@@ -1559,8 +1619,7 @@ func makeARecord(qType uint16, ip net.IP, ttl time.Duration) dns.RR {
 }
 
 // Craft dns records for a node
-// In case of an SRV query the answer will be a IN SRV and additional data will store an IN A to the node IP
-// Otherwise it will return a IN A record
+
 func (d *DNSServer) makeRecordFromNode(node *structs.Node, qType uint16, qName string, ttl time.Duration, maxRecursionLevel int) []dns.RR {
 	addrTranslate := TranslateAddressAcceptDomain
 	if qType == dns.TypeA {
@@ -1606,12 +1665,15 @@ func (d *DNSServer) makeRecordFromNode(node *structs.Node, qType uint16, qName s
 // Craft dns records for a service
 // In case of an SRV query the answer will be a IN SRV and additional data will store an IN A to the node IP
 // Otherwise it will return a IN A record
-func (d *DNSServer) makeRecordFromServiceNode(dc string, serviceNode structs.CheckServiceNode, addr net.IP, req *dns.Msg, ttl time.Duration) ([]dns.RR, []dns.RR) {
+
+func (d *DNSServer) makeRecordFromServiceNode(dc string, serviceNode structs.CheckServiceNode, addr net.IP, req *dns.Msg, ttl time.Duration) ([]dns.RR, []dns.RR, uint16) {
 	q := req.Question[0]
 	ipRecord := makeARecord(q.Qtype, addr, ttl)
 	if ipRecord == nil {
-		return nil, nil
+		return nil, nil, 0
 	}
+
+	weight := uint16(findWeight(serviceNode))
 
 	if q.Qtype == dns.TypeSRV {
 		nodeFQDN := fmt.Sprintf("%s.node.%s.%s", serviceNode.Node.Node, dc, d.domain)
@@ -1624,29 +1686,31 @@ func (d *DNSServer) makeRecordFromServiceNode(dc string, serviceNode structs.Che
 					Ttl:    uint32(ttl / time.Second),
 				},
 				Priority: 1,
-				Weight:   uint16(findWeight(serviceNode)),
+				Weight:   weight,
 				Port:     uint16(d.agent.TranslateServicePort(dc, serviceNode.Service.Port, serviceNode.Service.TaggedAddresses)),
 				Target:   nodeFQDN,
 			},
 		}
 
 		ipRecord.Header().Name = nodeFQDN
-		return answers, []dns.RR{ipRecord}
+		return answers, []dns.RR{ipRecord}, weight
 	}
 
 	ipRecord.Header().Name = q.Name
-	return []dns.RR{ipRecord}, nil
+	return []dns.RR{ipRecord}, nil, weight
 }
 
 // Craft dns records for an IP
 // In case of an SRV query the answer will be a IN SRV and additional data will store an IN A to the IP
 // Otherwise it will return a IN A record
-func (d *DNSServer) makeRecordFromIP(dc string, addr net.IP, serviceNode structs.CheckServiceNode, req *dns.Msg, ttl time.Duration) ([]dns.RR, []dns.RR) {
+func (d *DNSServer) makeRecordFromIP(dc string, addr net.IP, serviceNode structs.CheckServiceNode, req *dns.Msg, ttl time.Duration) ([]dns.RR, []dns.RR, uint16) {
 	q := req.Question[0]
 	ipRecord := makeARecord(q.Qtype, addr, ttl)
 	if ipRecord == nil {
-		return nil, nil
+		return nil, nil, 0
 	}
+
+	weight := uint16(findWeight(serviceNode))
 
 	if q.Qtype == dns.TypeSRV {
 		ipFQDN := d.encodeIPAsFqdn(dc, addr)
@@ -1659,24 +1723,26 @@ func (d *DNSServer) makeRecordFromIP(dc string, addr net.IP, serviceNode structs
 					Ttl:    uint32(ttl / time.Second),
 				},
 				Priority: 1,
-				Weight:   uint16(findWeight(serviceNode)),
+				Weight:   weight,
 				Port:     uint16(d.agent.TranslateServicePort(dc, serviceNode.Service.Port, serviceNode.Service.TaggedAddresses)),
 				Target:   ipFQDN,
 			},
 		}
 
 		ipRecord.Header().Name = ipFQDN
-		return answers, []dns.RR{ipRecord}
+		return answers, []dns.RR{ipRecord}, weight
 	}
 
 	ipRecord.Header().Name = q.Name
-	return []dns.RR{ipRecord}, nil
+	return []dns.RR{ipRecord}, nil, weight
 }
 
 // Craft dns records for an FQDN
 // In case of an SRV query the answer will be a IN SRV and additional data will store an IN A to the IP
 // Otherwise it will return a CNAME and a IN A record
-func (d *DNSServer) makeRecordFromFQDN(dc string, fqdn string, serviceNode structs.CheckServiceNode, req *dns.Msg, ttl time.Duration, cfg *dnsConfig, maxRecursionLevel int) ([]dns.RR, []dns.RR) {
+func (d *DNSServer) makeRecordFromFQDN(dc string, fqdn string, serviceNode structs.CheckServiceNode, req *dns.Msg, ttl time.Duration, cfg *dnsConfig, maxRecursionLevel int) ([]dns.RR, []dns.RR, uint16) {
+	weight := uint16(findWeight(serviceNode))
+
 	edns := req.IsEdns0() != nil
 	q := req.Question[0]
 
@@ -1708,12 +1774,12 @@ MORE_REC:
 					Ttl:    uint32(ttl / time.Second),
 				},
 				Priority: 1,
-				Weight:   uint16(findWeight(serviceNode)),
+				Weight:   weight,
 				Port:     uint16(d.agent.TranslateServicePort(dc, serviceNode.Service.Port, serviceNode.Service.TaggedAddresses)),
 				Target:   dns.Fqdn(fqdn),
 			},
 		}
-		return answers, additional
+		return answers, additional, weight
 	}
 
 	answers := []dns.RR{
@@ -1728,10 +1794,10 @@ MORE_REC:
 		}}
 	answers = append(answers, additional...)
 
-	return answers, nil
+	return answers, nil, weight
 }
 
-func (d *DNSServer) nodeServiceRecords(dc string, node structs.CheckServiceNode, req *dns.Msg, ttl time.Duration, cfg *dnsConfig, maxRecursionLevel int) ([]dns.RR, []dns.RR) {
+func (d *DNSServer) nodeServiceRecords(dc string, node structs.CheckServiceNode, req *dns.Msg, ttl time.Duration, cfg *dnsConfig, maxRecursionLevel int) ([]dns.RR, []dns.RR, uint16) {
 	addrTranslate := TranslateAddressAcceptDomain
 	if req.Question[0].Qtype == dns.TypeA {
 		addrTranslate |= TranslateAddressAcceptIPv4
@@ -1744,7 +1810,7 @@ func (d *DNSServer) nodeServiceRecords(dc string, node structs.CheckServiceNode,
 	serviceAddr := d.agent.TranslateServiceAddress(dc, node.Service.Address, node.Service.TaggedAddresses, addrTranslate)
 	nodeAddr := d.agent.TranslateAddress(node.Node.Datacenter, node.Node.Address, node.Node.TaggedAddresses, addrTranslate)
 	if serviceAddr == "" && nodeAddr == "" {
-		return nil, nil
+		return nil, nil, 0
 	}
 
 	nodeIPAddr := net.ParseIP(nodeAddr)
@@ -1805,6 +1871,9 @@ func (d *DNSServer) generateMeta(qName string, node *structs.Node, ttl time.Dura
 func (d *DNSServer) serviceSRVRecords(cfg *dnsConfig, dc string, nodes structs.CheckServiceNodes, req, resp *dns.Msg, ttl time.Duration, maxRecursionLevel int) {
 	handled := make(map[string]struct{})
 
+	// What want to do:
+	// Get answers. Sort by SRV record by weight. Problem: this won't sort A records, only SRV.
+	// A records don't have weight. They'd have to be sorted beforehand.
 	for _, node := range nodes {
 		// Avoid duplicate entries, possible if a node has
 		// the same service the same port, etc.
@@ -1816,7 +1885,8 @@ func (d *DNSServer) serviceSRVRecords(cfg *dnsConfig, dc string, nodes structs.C
 		}
 		handled[tuple] = struct{}{}
 
-		answers, extra := d.nodeServiceRecords(dc, node, req, ttl, cfg, maxRecursionLevel)
+		answers, extra, weight := d.nodeServiceRecords(dc, node, req, ttl, cfg, maxRecursionLevel)
+		fmt.Printf("Weight: %d\n", weight)
 
 		resp.Answer = append(resp.Answer, answers...)
 		resp.Extra = append(resp.Extra, extra...)
